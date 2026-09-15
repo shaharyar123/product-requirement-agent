@@ -1,4 +1,4 @@
-# My First AI Agent
+# Product Requirement Agent
 
 A beginner-friendly Product Requirements Agent built with TypeScript and the OpenAI Agents SDK.
 
