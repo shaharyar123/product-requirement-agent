@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Spec Agent</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, sans-serif;
+      }
+      body {
+        max-width: 52rem;
+        margin: 1.5rem auto;
+        padding: 0 1rem 3rem;
+        line-height: 1.4;
+      }
+      h1,
+      h2 {
+        font-weight: 600;
+      }
+      textarea,
+      input[type="text"] {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 0.5rem;
+        font: inherit;
+      }
+      textarea {
+        min-height: 8rem;
+      }
+      button {
+        font: inherit;
+        padding: 0.4rem 0.8rem;
+        cursor: pointer;
+      }
+      button:disabled {
+        cursor: wait;
+        opacity: 0.7;
+      }
+      .row {
+        display: flex;
+        gap: 0.5rem;
+        flex-wrap: wrap;
+        margin: 0.5rem 0 1rem;
+      }
+      .status {
+        font-weight: 600;
+      }
+      .question {
+        border: 1px solid currentColor;
+        padding: 0.75rem;
+        margin: 0.75rem 0;
+      }
+      .question p {
+        margin: 0.25rem 0;
+      }
+      .muted {
+        opacity: 0.75;
+        font-size: 0.9rem;
+      }
+      pre {
+        white-space: pre-wrap;
+        border: 1px solid currentColor;
+        padding: 0.75rem;
+        overflow: auto;
+      }
+      .error {
+        color: tomato;
+      }
+      #log {
+        list-style: none;
+        padding: 0;
+        font-size: 0.9rem;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Spec agent</h1>
+    <p class="muted">
+      Intake → questions → answers → requirements → plan. Same machine as the API.
+    </p>
+
+    <label for="prd">Product intake</label>
+    <textarea id="prd" placeholder="A streaming platform like netflix but free"></textarea>
+    <label for="notifyTo">Slack channel, email, or username (optional)</label>
+    <input
+      id="notifyTo"
+      type="text"
+      placeholder="#all-ai-factory-championship"
+    />
+    <div class="row">
+      <button id="start" type="button">Start run</button>
+      <button id="sample" type="button">Fill sample</button>
+    </div>
+
+    <p>Status: <span id="status" class="status">idle</span></p>
+    <p id="error" class="error"></p>
+    <ul id="log"></ul>
+
+    <section id="questions-section" hidden>
+      <h2>Clarification questions</h2>
+      <p class="muted">
+        Slack replies are watched automatically. You can also fill this form or
+        click Import Slack replies.
+      </p>
+      <form id="answers-form"></form>
+      <div class="row">
+        <button id="submit" type="button">Submit answers</button>
+        <button id="slack-import" type="button" hidden>Import Slack replies</button>
+      </div>
+    </section>
+
+    <section id="results-section" hidden>
+      <h2>Requirements</h2>
+      <pre id="requirements"></pre>
+      <h2>Plan</h2>
+      <pre id="plan"></pre>
+    </section>
+
+    <script>
+      const prdEl = document.getElementById("prd");
+      const statusEl = document.getElementById("status");
+      const errorEl = document.getElementById("error");
+      const logEl = document.getElementById("log");
+      const startBtn = document.getElementById("start");
+      const sampleBtn = document.getElementById("sample");
+      const submitBtn = document.getElementById("submit");
+      const slackImportBtn = document.getElementById("slack-import");
+      const notifyEl = document.getElementById("notifyTo");
+      const questionsSection = document.getElementById("questions-section");
+      const answersForm = document.getElementById("answers-form");
+      const resultsSection = document.getElementById("results-section");
+      const requirementsEl = document.getElementById("requirements");
+      const planEl = document.getElementById("plan");
+
+      let runId = null;
+      let pollTimer = null;
+
+      sampleBtn.onclick = () => {
+        prdEl.value = "A streaming platform like netflix but free";
+      };
+
+      startBtn.onclick = () => run(startRun);
+      submitBtn.onclick = () => run(submitAnswers);
+      slackImportBtn.onclick = () => run(importSlack);
+
+      async function run(fn) {
+        errorEl.textContent = "";
+        startBtn.disabled = true;
+        submitBtn.disabled = true;
+        slackImportBtn.disabled = true;
+        try {
+          await fn();
+        } catch (error) {
+          errorEl.textContent = error instanceof Error ? error.message : String(error);
+        } finally {
+          startBtn.disabled = false;
+          submitBtn.disabled = false;
+          slackImportBtn.disabled = false;
+        }
+      }
+
+      async function startRun() {
+        resultsSection.hidden = true;
+        const body = {};
+        if (prdEl.value.trim()) {
+          body.prd = prdEl.value.trim();
+        }
+        if (notifyEl.value.trim()) {
+          body.notifyTo = notifyEl.value.trim();
+        }
+        const data = await post("/spec/runs", body);
+        runId = data.id;
+        renderRun(data);
+        startPoll();
+      }
+
+      async function importSlack() {
+        if (!runId) {
+          throw new Error("Start a run first.");
+        }
+        const data = await post("/spec/runs/" + runId + "/slack-answers", {});
+        for (const item of data.answers || []) {
+          const input = answersForm.querySelector('[data-id="' + item.id + '"]');
+          if (input) {
+            input.value = item.answer;
+          }
+        }
+      }
+
+      async function submitAnswers() {
+        if (!runId) {
+          throw new Error("Start a run first.");
+        }
+        const answers = [...answersForm.querySelectorAll("textarea")].map((input) => ({
+          id: input.dataset.id,
+          answer: input.value.trim(),
+        }));
+        statusEl.textContent = "running (requirements + plan, wait)";
+        const data = await post("/spec/runs/" + runId + "/answers", { answers });
+        stopPoll();
+        renderRun(data);
+      }
+
+      function startPoll() {
+        stopPoll();
+        pollTimer = setInterval(async () => {
+          if (!runId) {
+            return;
+          }
+          try {
+            const res = await fetch("/spec/runs/" + runId);
+            const data = await res.json();
+            renderRun(data, data.status === "waiting_for_answers");
+            if (data.status !== "waiting_for_answers") {
+              stopPoll();
+            }
+          } catch {
+            // Keep polling; a single failed tick is not fatal.
+          }
+        }, 4000);
+      }
+
+      function stopPoll() {
+        if (pollTimer) {
+          clearInterval(pollTimer);
+          pollTimer = null;
+        }
+      }
+
+      function renderRun(run, preserveForm) {
+        statusEl.textContent = run.status + " · " + run.id;
+        logEl.innerHTML = "";
+        for (const event of run.events || []) {
+          const item = document.createElement("li");
+          item.textContent = event.type + ": " + event.message;
+          logEl.appendChild(item);
+        }
+
+        if (run.status === "waiting_for_answers") {
+          questionsSection.hidden = false;
+          if (!preserveForm || answersForm.childElementCount === 0) {
+            answersForm.innerHTML = "";
+            for (const question of run.questions) {
+              const wrap = document.createElement("div");
+              wrap.className = "question";
+              wrap.innerHTML =
+                "<p><strong>" +
+                escapeHtml(question.id) +
+                "</strong> · " +
+                escapeHtml(question.topic) +
+                (question.required ? " · required" : "") +
+                "</p><p>" +
+                escapeHtml(question.question) +
+                "</p><p class='muted'>" +
+                escapeHtml(question.why) +
+                "</p>";
+              const input = document.createElement("textarea");
+              input.dataset.id = question.id;
+              input.required = question.required;
+              wrap.appendChild(input);
+              answersForm.appendChild(wrap);
+            }
+          }
+        } else {
+          questionsSection.hidden = true;
+        }
+        slackImportBtn.hidden = !run.slackChannel;
+
+        if (run.requirementsMarkdown || run.planMarkdown) {
+          resultsSection.hidden = false;
+          requirementsEl.textContent = run.requirementsMarkdown || "";
+          planEl.textContent = run.planMarkdown || "";
+        }
+
+        if (run.error) {
+          errorEl.textContent = run.error;
+        }
+      }
+
+      async function post(url, payload) {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          if (data && data.id && data.status) {
+            return data;
+          }
+          const message = Array.isArray(data.message)
+            ? data.message.join(" ")
+            : data.message;
+          throw new Error(message || res.statusText);
+        }
+        return data;
+      }
+
+      function escapeHtml(value) {
+        return String(value)
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;");
+      }
+    </script>
+  </body>
+</html>
